@@ -68,8 +68,7 @@ COMPONENTS_FILE_EXTENSION = '.components'
 METADATA_FILE_EXTENSION = '.issue_metadata'
 
 # Header format for logs.
-LOG_HEADER_FORMAT = (
-    'Command: {command}\n' + 'Bot: {bot}\n' + 'Time ran: {time}\n')
+LOG_HEADER_FORMAT = ('Command: {command}\n' + 'Time ran: {time}\n')
 
 # Number of radamsa mutations.
 RADAMSA_MUTATIONS = 2000
@@ -215,8 +214,12 @@ def generate_new_testcase_mutations_using_ml_rnn(
   # No return value for now. Will add later if this is necessary.
   # Defer import to prevent issues with tensorflow causing hangs with
   # multiprocessing.
-  # TODO(ochang): handle this is a better way.
-  from bot.fuzzers.ml.rnn import generator as ml_rnn_generator
+  try:
+    from bot.fuzzers.ml.rnn import generator as ml_rnn_generator
+  except Exception:
+    logs.log_warn('Failed to import ml_rnn generator, skipping.')
+    return
+
   ml_rnn_generator.execute(corpus_directory, new_testcase_mutations_directory,
                            fuzzer_name, generation_timeout)
 
@@ -262,6 +265,11 @@ def decide_with_probability(probability):
   return random.SystemRandom().random() < probability
 
 
+def get_probability():
+  """Obtain a random number."""
+  return random.SystemRandom().random()
+
+
 def get_testcase_run(stats, fuzzer_command):
   """Get testcase run for stats."""
   build_revision = fuzzer_utils.get_build_revision()
@@ -304,7 +312,7 @@ def find_fuzzer_path(build_directory, fuzzer_name, is_blackbox=False):
     # Fuchsia targets are not on disk.
     return fuzzer_name
 
-  if environment.platform() == 'ANDROID_KERNEL':
+  if environment.is_android_kernel():
     return os.path.join(build_directory, 'syzkaller', 'bin', 'syz-manager')
 
   # TODO(ochang): This is necessary for legacy testcases, which include the
@@ -702,7 +710,7 @@ def unpack_seed_corpus_if_needed(fuzz_target_path,
            (idx, seed_corpus_archive_path))
 
 
-def get_log_header(command, bot_name, time_executed):
+def get_log_header(command, time_executed):
   """Get the log header."""
   return LOG_HEADER_FORMAT.format(
-      command=get_command_quoted(command), bot=bot_name, time=time_executed)
+      command=get_command_quoted(command), time=time_executed)

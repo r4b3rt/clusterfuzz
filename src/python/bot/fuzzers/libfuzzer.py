@@ -16,6 +16,7 @@
 import collections
 import contextlib
 import copy
+import functools
 import os
 import random
 import re
@@ -37,6 +38,7 @@ from fuzzing import strategy
 from metrics import logs
 from platforms import android
 from platforms import fuchsia
+from platforms.fuchsia import undercoat
 from platforms.fuchsia.device import QemuProcess
 from platforms.fuchsia.device import start_qemu
 from platforms.fuchsia.device import stop_qemu
@@ -411,6 +413,201 @@ class LibFuzzerRunner(new_process.UnicodeProcessRunner, LibFuzzerCommon):
 class UnshareLibFuzzerRunner(new_process.UnshareProcessRunnerMixin,
                              new_process.UnicodeProcessRunner, LibFuzzerCommon):
   """LibFuzzerRunner which unshares."""
+
+
+class FuchsiaUndercoatLibFuzzerRunner(new_process.UnicodeProcessRunner,
+                                      LibFuzzerCommon):
+  """libFuzzer runner (when Fuchsia is the target platform, and undercoat
+  is used)."""
+
+  def __init__(self, executable_path, instance_handle, default_args=None):
+    # An instance_handle from undercoat is required, and should be set up by the
+    # build_manager.
+    # Note: In this case executable_path is simply `package/fuzzer`
+    super().__init__(executable_path=executable_path, default_args=default_args)
+    self.handle = instance_handle
+
+  def _corpus_directories_libfuzzer(self, corpus_directories):
+    """ Returns the corpus directory paths expected by libfuzzer itself. """
+    return [
+        self._target_corpus_path(os.path.basename(corpus_dir))
+        for corpus_dir in corpus_directories
+    ]
+
+  def _new_corpus_dir_host(self, corpus_directories):
+    """ Returns the path of the 'new' corpus directory on the host. """
+    return corpus_directories[0]
+
+  def _new_corpus_dir_target(self, corpus_directories):
+    """ Returns the path of the 'new' corpus directory on the target. """
+    return self._target_corpus_path(
+        os.path.basename(self._new_corpus_dir_host(corpus_directories)))
+
+  def _target_corpus_path(self, corpus_name):
+    """ Returns the path of a given corpus directory on the target. """
+    return 'data/corpus/' + corpus_name
+
+  def _push_corpora_from_host_to_target(self, corpus_directories):
+    # Push corpus directories to the device.
+    self._clear_all_target_corpora()
+    logs.log('Push corpora from host to target.')
+    for corpus_dir in corpus_directories:
+      undercoat.put_data(self.handle, self.executable_path, corpus_dir,
+                         'data/corpus')
+
+  def _pull_new_corpus_from_target_to_host(self, corpus_directories):
+    """ Pull corpus directories from device to host. """
+    # Appending '/*' indicates we want all the *files* in the target's
+    # directory, rather than the directory itself.
+    logs.log('Fuzzer ran; pulling down corpus')
+    new_corpus_files_target = self._new_corpus_dir_target(
+        corpus_directories) + '/*'
+    undercoat.get_data(self.handle, self.executable_path,
+                       new_corpus_files_target,
+                       self._new_corpus_dir_host(corpus_directories))
+
+  def _clear_all_target_corpora(self):
+    """ Clears out all the corpora on the target. """
+    logs.log('Clearing corpora on target')
+    # prepare_fuzzer resets the data/ directory
+    undercoat.prepare_fuzzer(self.handle, self.executable_path)
+
+  def fuzz(self,
+           corpus_directories,
+           fuzz_timeout,
+           artifact_prefix=None,
+           additional_args=None,
+           extra_env=None):
+    """LibFuzzerCommon.fuzz override."""
+    additional_args = copy.copy(additional_args)
+    if additional_args is None:
+      additional_args = []
+
+    undercoat.prepare_fuzzer(self.handle, self.executable_path)
+    self._push_corpora_from_host_to_target(corpus_directories)
+
+    max_total_time = self.get_max_total_time(fuzz_timeout)
+    if any(arg.startswith(constants.FORK_FLAG) for arg in additional_args):
+      max_total_time -= self.LIBFUZZER_FORK_MODE_CLEAN_EXIT_TIME
+    assert max_total_time > 0
+
+    additional_args.extend([
+        constants.MAX_TOTAL_TIME_FLAG + str(max_total_time),
+        constants.PRINT_FINAL_STATS_ARGUMENT,
+    ])
+
+    # Run the fuzzer.
+    # TODO(eep): Clarify comment from previous implementation: "actually we want
+    # new_corpus_relative_dir_target for *each* corpus"
+    result = undercoat.run_fuzzer(
+        self.handle, self.executable_path, artifact_prefix,
+        self._corpus_directories_libfuzzer(corpus_directories) +
+        additional_args)
+
+    self._pull_new_corpus_from_target_to_host(corpus_directories)
+    self._clear_all_target_corpora()
+    return result
+
+  def merge(self,
+            corpus_directories,
+            merge_timeout,
+            artifact_prefix=None,
+            tmp_dir=None,
+            additional_args=None,
+            merge_control_file=None):
+
+    undercoat.prepare_fuzzer(self.handle, self.executable_path)
+    self._push_corpora_from_host_to_target(corpus_directories)
+
+    additional_args = copy.copy(additional_args)
+    if additional_args is None:
+      additional_args = []
+    max_total_time_flag = constants.MAX_TOTAL_TIME_FLAG + str(merge_timeout)
+    additional_args.append(max_total_time_flag)
+
+    target_merge_control_file = 'data/.mergefile'
+
+    if merge_control_file:
+      undercoat.put_data(self.handle, self.executable_path, merge_control_file,
+                         target_merge_control_file)
+
+    # Run merge.
+    additional_args += [
+        '-merge=1', '-merge_control_file=' + target_merge_control_file
+    ]
+    result = undercoat.run_fuzzer(
+        self.handle, self.executable_path, None,
+        self._corpus_directories_libfuzzer(corpus_directories) +
+        additional_args)
+
+    self._pull_new_corpus_from_target_to_host(corpus_directories)
+    if merge_control_file:
+      undercoat.put_data(self.handle, self.executable_path,
+                         target_merge_control_file, merge_control_file)
+
+    self._clear_all_target_corpora()
+    return result
+
+  def run_single_testcase(self,
+                          testcase_path,
+                          timeout=None,
+                          additional_args=None):
+    """Run a single testcase."""
+    #TODO(eep): Are all these copy.copy() calls still necessary?
+    additional_args = copy.copy(additional_args)
+    if additional_args is None:
+      additional_args = []
+
+    # We need to push the testcase to the device and pass in the name.
+    testcase_path_name = os.path.basename(os.path.normpath(testcase_path))
+    undercoat.prepare_fuzzer(self.handle, self.executable_path)
+    undercoat.put_data(self.handle, self.executable_path, testcase_path,
+                       'data/')
+
+    result = undercoat.run_fuzzer(
+        self.handle, self.executable_path, None,
+        ['data/' + testcase_path_name] + additional_args)
+    return result
+
+  def minimize_crash(self,
+                     testcase_path,
+                     output_path,
+                     timeout,
+                     artifact_prefix=None,
+                     additional_args=None):
+
+    additional_args = copy.copy(additional_args)
+    if additional_args is None:
+      additional_args = []
+    additional_args.append(constants.MINIMIZE_CRASH_ARGUMENT)
+    max_total_time = self.get_minimize_total_time(timeout)
+    max_total_time_arg = constants.MAX_TOTAL_TIME_FLAG + str(max_total_time)
+    additional_args.append(max_total_time_arg)
+
+    target_artifact_prefix = 'data/'
+    target_minimized_file = 'final-minimized-crash'
+    min_file_fullpath = target_artifact_prefix + target_minimized_file
+    exact_artifact_arg = constants.EXACT_ARTIFACT_PATH_FLAG + min_file_fullpath
+    additional_args.append(exact_artifact_arg)
+
+    # We need to push the testcase to the device and pass in the name.
+    testcase_path_name = os.path.basename(os.path.normpath(testcase_path))
+    undercoat.prepare_fuzzer(self.handle, self.executable_path)
+    undercoat.put_data(self.handle, self.executable_path, testcase_path,
+                       'data/')
+
+    output_dir = os.path.dirname(output_path)
+    result = undercoat.run_fuzzer(
+        self.handle, self.executable_path, output_dir,
+        ['data/' + testcase_path_name] + additional_args)
+
+    # The minimized artifact is automatically fetched if minimization succeeded,
+    # but this isn't always the case so let's just always fetch a new copy
+    undercoat.get_data(self.handle, self.executable_path, min_file_fullpath,
+                       output_dir)
+    shutil.move(os.path.join(output_dir, target_minimized_file), output_path)
+
+    return result
 
 
 class FuchsiaQemuLibFuzzerRunner(new_process.UnicodeProcessRunner,
@@ -1040,7 +1237,7 @@ class AndroidLibFuzzerRunner(new_process.UnicodeProcessRunner, LibFuzzerCommon):
         default_args=self._get_default_args(executable_path, default_args))
 
     android.adb.create_directory_if_needed(self.LIBFUZZER_TEMP_DIR)
-    self._copy_local_directory_to_device(build_directory)
+    self.copy_local_directory_to_device(build_directory)
 
   def _get_default_args(self, executable_path, extra_args):
     """Return a set of default arguments to pass to adb binary."""
@@ -1086,9 +1283,9 @@ class AndroidLibFuzzerRunner(new_process.UnicodeProcessRunner, LibFuzzerCommon):
   def _copy_local_directories_to_device(self, local_directories):
     """Copies local directories to device."""
     for local_directory in sorted(set(local_directories)):
-      self._copy_local_directory_to_device(local_directory)
+      self.copy_local_directory_to_device(local_directory)
 
-  def _copy_local_directory_to_device(self, local_directory):
+  def copy_local_directory_to_device(self, local_directory):
     """Copy local directory to device."""
     device_directory = self._get_device_path(local_directory)
     android.adb.remove_directory(device_directory, recreate=True)
@@ -1297,6 +1494,49 @@ class AndroidLibFuzzerRunner(new_process.UnicodeProcessRunner, LibFuzzerCommon):
       return result
 
 
+def wrap_emulator(func):
+  """Wrap a function with calls to start and stop the emulator."""
+
+  @functools.wraps(func)
+  def wrapper(self, *args, **kwargs):
+    emu_proc = android.emulator.EmulatorProcess()
+    emu_proc.create(self.build_dir)
+    emu_proc.run()
+
+    android.adb.run_as_root()
+    android.adb.create_directory_if_needed(self.LIBFUZZER_TEMP_DIR)
+    self.copy_local_directory_to_device(self.build_dir)
+
+    result = func(self, *args, **kwargs)
+    emu_proc.kill()
+    return result
+
+  return wrapper
+
+
+class AndroidEmulatorLibFuzzerRunner(AndroidLibFuzzerRunner):
+  """Android emulator libFuzzer runner."""
+
+  def __init__(self, executable_path, build_directory, default_args=None):
+    """Inits the AndroidEmulatorLibFuzzerRunner.
+
+    Args:
+      executable_path: Path to the fuzzer executable.
+      build_directory: A MinijailChroot.
+      default_args: Default arguments to always pass to the fuzzer.
+    """
+    self.build_dir = build_directory
+    super().__init__(executable_path, build_directory, default_args)
+
+  analyze_dictionary = wrap_emulator(AndroidLibFuzzerRunner.analyze_dictionary)
+  fuzz = wrap_emulator(AndroidLibFuzzerRunner.fuzz)
+  merge = wrap_emulator(AndroidLibFuzzerRunner.merge)
+  run_single_testcase = wrap_emulator(
+      AndroidLibFuzzerRunner.run_single_testcase)
+  minimize_crash = wrap_emulator(AndroidLibFuzzerRunner.minimize_crash)
+  cleanse_crash = wrap_emulator(AndroidLibFuzzerRunner.cleanse_crash)
+
+
 def get_runner(fuzzer_path, temp_dir=None, use_minijail=None, use_unshare=None):
   """Get a libfuzzer runner."""
   if use_minijail is None:
@@ -1364,7 +1604,15 @@ def get_runner(fuzzer_path, temp_dir=None, use_minijail=None, use_unshare=None):
 
     runner = MinijailLibFuzzerRunner(fuzzer_path, minijail_chroot)
   elif is_fuchsia:
-    runner = FuchsiaQemuLibFuzzerRunner(fuzzer_path)
+    if environment.get_value('FUCHSIA_USE_UNDERCOAT'):
+      instance_handle = environment.get_value('FUCHSIA_INSTANCE_HANDLE')
+      if not instance_handle:
+        raise undercoat.UndercoatError('Instance handle not provided.')
+      runner = FuchsiaUndercoatLibFuzzerRunner(fuzzer_path, instance_handle)
+    else:
+      runner = FuchsiaQemuLibFuzzerRunner(fuzzer_path)
+  elif environment.is_android_emulator():
+    runner = AndroidEmulatorLibFuzzerRunner(fuzzer_path, build_dir)
   elif is_android:
     runner = AndroidLibFuzzerRunner(fuzzer_path, build_dir)
   elif use_unshare:

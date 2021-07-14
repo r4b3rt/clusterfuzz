@@ -22,8 +22,10 @@ from bot import testcase_manager
 from bot.tasks import setup
 from build_management import build_manager
 from build_management import revisions
+from chrome import build_info
 from datastore import data_handler
 from datastore import data_types
+from metrics import logs
 from system import environment
 
 
@@ -53,20 +55,27 @@ class Impact(object):
 
 
 class Impacts(object):
-  """Represents both stable and beta impacts."""
+  """Represents extended stable, stable and beta impacts."""
 
-  def __init__(self, stable=None, beta=None):
+  def __init__(self, stable=None, beta=None, extended_stable=None, head=None):
     self.stable = stable or Impact()
     self.beta = beta or Impact()
+    self.extended_stable = extended_stable or Impact()
+    self.head = head or Impact()
 
   def is_empty(self):
-    return self.stable.is_empty() and self.beta.is_empty()
+    return (self.extended_stable.is_empty() and self.stable.is_empty() and
+            self.beta.is_empty() and self.head.is_empty())
 
   def get_extra_trace(self):
-    return (self.stable.extra_trace + '\n' + self.beta.extra_trace).strip()
+    return (
+        self.extended_stable.extra_trace + '\n' + self.stable.extra_trace + '\n'
+        + self.beta.extra_trace + '\n' + self.head.extra_trace).strip()
 
   def __eq__(self, other):
-    return self.stable == other.stable and self.beta == other.beta
+    return (self.extended_stable == other.extended_stable and
+            self.stable == other.stable and self.beta == other.beta and
+            self.head == other.head)
 
 
 def get_chromium_component_start_and_end_revision(start_revision, end_revision,
@@ -125,12 +134,21 @@ def get_component_impacts_from_url(component_name,
   if not end_revision:
     return Impacts()
 
+  build_revision_mappings = build_info.get_build_to_revision_mappings(platform)
+  if not build_revision_mappings:
+    return Impacts()
+
   found_impacts = dict()
-  for build in ['stable', 'beta']:
-    build_revision_mappings = revisions.get_build_to_revision_mappings(platform)
-    if not build_revision_mappings:
-      return Impacts()
+  for build in ['extended_stable', 'stable', 'beta', 'canary']:
     mapping = build_revision_mappings.get(build)
+    # TODO(yuanjunh): bypass for now but remove it after ES is enabled.
+    if build == 'extended_stable' and not mapping:
+      found_impacts[build] = Impact()
+      continue
+    # Some platforms don't have canary, so use dev to represent
+    # the affected head version.
+    if build == 'canary' and not mapping:
+      mapping = build_revision_mappings.get('dev')
     if not mapping:
       return Impacts()
     chromium_revision = mapping['revision']
@@ -147,7 +165,8 @@ def get_component_impacts_from_url(component_name,
         'version': mapping['version']
     }, start_revision, end_revision)
     found_impacts[build] = impact
-  return Impacts(found_impacts['stable'], found_impacts['beta'])
+  return Impacts(found_impacts['stable'], found_impacts['beta'],
+                 found_impacts['extended_stable'], found_impacts['canary'])
 
 
 def get_impacts_from_url(regression_range, job_type, platform=None):
@@ -162,16 +181,20 @@ def get_impacts_from_url(regression_range, job_type, platform=None):
   if not end_revision:
     return Impacts()
 
-  build_revision_mappings = revisions.get_build_to_revision_mappings(platform)
+  build_revision_mappings = build_info.get_build_to_revision_mappings(platform)
   if not build_revision_mappings:
     return Impacts()
 
+  extended_stable = get_impact(
+      build_revision_mappings.get('extended_stable'), start_revision,
+      end_revision)
   stable = get_impact(
       build_revision_mappings.get('stable'), start_revision, end_revision)
   beta = get_impact(
       build_revision_mappings.get('beta'), start_revision, end_revision)
+  head = get_head_impact(build_revision_mappings, start_revision, end_revision)
 
-  return Impacts(stable, beta)
+  return Impacts(stable, beta, extended_stable, head)
 
 
 def get_impact(build_revision, start_revision, end_revision):
@@ -198,7 +221,8 @@ def get_impact(build_revision, start_revision, end_revision):
 
 
 def get_impacts_on_prod_builds(testcase, testcase_file_path):
-  """Get testcase impact on production builds, which are stable and beta."""
+  """Get testcase impact on production builds, which are extended stable, stable
+  and beta."""
   impacts = Impacts()
   try:
     impacts.stable = get_impact_on_build(
@@ -213,12 +237,39 @@ def get_impacts_on_prod_builds(testcase, testcase_file_path):
     # If beta fails to get the binary, we ignore. At least, we have stable.
     pass
 
+  try:
+    impacts.extended_stable = get_impact_on_build(
+        'extended_stable', testcase.impact_extended_stable_version, testcase,
+        testcase_file_path)
+  except Exception as e:
+    # TODO(yuanjunh): undo the exception bypass for ES.
+    logs.log_warn('Caught errors in getting impact on extended stable: %s' % e)
+
+  # Always record the affected head version.
+  start_revision, end_revision = get_start_and_end_revision(
+      testcase.regression, testcase.job_type)
+  build_revision_mappings = build_info.get_build_to_revision_mappings()
+  impacts.head = get_head_impact(build_revision_mappings, start_revision,
+                                 end_revision)
+
   return impacts
+
+
+def get_head_impact(build_revision_mappings, start_revision, end_revision):
+  """Return the impact on 'head', i.e. the latest build we can find."""
+  latest_build = build_revision_mappings.get('canary')
+  if latest_build is None:
+    latest_build = build_revision_mappings.get('dev')
+  return get_impact(latest_build, start_revision, end_revision)
 
 
 def get_impact_on_build(build_type, current_version, testcase,
                         testcase_file_path):
   """Return impact and additional trace on a prod build given build_type."""
+  # TODO(yuanjunh): remove es_enabled var after testing is done.
+  es_enabled = testcase.get_metadata('es_enabled', False)
+  if build_type == 'extended_stable' and not es_enabled:
+    return Impact()
   build = build_manager.setup_production_build(build_type)
   if not build:
     raise BuildFailedException(
@@ -234,6 +285,11 @@ def get_impact_on_build(build_type, current_version, testcase,
   app_path = environment.get_value('APP_PATH')
   command = testcase_manager.get_command_line_for_application(
       testcase_file_path, app_path=app_path, needs_http=testcase.http_flag)
+
+  if es_enabled:
+    logs.log(
+        "ES build for testcase %d, command: %s" % (testcase.key.id(), command))
+
   result = testcase_manager.test_for_crash_with_retries(
       testcase,
       testcase_file_path,
@@ -253,10 +309,15 @@ def get_impact_on_build(build_type, current_version, testcase,
 
 def set_testcase_with_impacts(testcase, impacts):
   """Set testcase's impact-related fields given impacts."""
+  testcase.impact_extended_stable_version = impacts.extended_stable.version
+  testcase.impact_extended_stable_version_likely = \
+    impacts.extended_stable.likely
   testcase.impact_stable_version = impacts.stable.version
   testcase.impact_stable_version_likely = impacts.stable.likely
   testcase.impact_beta_version = impacts.beta.version
   testcase.impact_beta_version_likely = impacts.beta.likely
+  testcase.impact_head_version = impacts.head.version
+  testcase.impact_head_version_likely = impacts.head.likely
   testcase.is_impact_set_flag = True
 
 
@@ -319,7 +380,8 @@ def execute_task(testcase_id, job_type):
   if not file_list:
     return
 
-  # Setup stable, beta builds and get impact and crash stacktrace.
+  # Setup extended stable, stable, beta builds
+  # and get impact and crash stacktrace.
   try:
     impacts = get_impacts_on_prod_builds(testcase, testcase_file_path)
   except BuildFailedException as error:

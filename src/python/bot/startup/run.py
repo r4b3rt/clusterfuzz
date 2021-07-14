@@ -99,7 +99,7 @@ def start_heartbeat(heartbeat_command):
 
   try:
     command = shell.get_command(heartbeat_command)
-    process_handle = subprocess.Popen(command)
+    process_handle = subprocess.Popen(command)  # pylint: disable=consider-using-with
   except Exception:
     logs.log_error(
         'Unable to start heartbeat process (%s).' % heartbeat_command)
@@ -163,6 +163,11 @@ def run_loop(bot_command, heartbeat_command):
     sleep(LOOP_SLEEP_INTERVAL)
 
 
+def set_start_time():
+  """Set START_TIME."""
+  environment.set_value('START_TIME', time.time())
+
+
 def main():
   root_directory = environment.get_value('ROOT_DIR')
   if not root_directory:
@@ -171,6 +176,7 @@ def main():
     print('For an example, check init.bash in the local directory.')
     return
 
+  set_start_time()
   environment.set_bot_environment()
   persistent_cache.initialize()
   logs.configure('run')

@@ -14,6 +14,7 @@
 """Build manager."""
 
 import os
+import random
 import re
 import subprocess
 import time
@@ -33,6 +34,7 @@ from metrics import logs
 from platforms import android
 from system import archive
 from system import environment
+from system import new_process
 from system import shell
 
 # The default environment variables for specifying build bucket paths.
@@ -47,7 +49,7 @@ REVISION_FILE_NAME = 'REVISION'
 
 # Various build type mapping strings.
 BUILD_TYPE_SUBSTRINGS = [
-    '-beta', '-stable', '-debug', '-release', '-symbolized'
+    '-beta', '-stable', '-debug', '-release', '-symbolized', '-extended_stable'
 ]
 
 # Build eviction constants.
@@ -76,9 +78,10 @@ FUZZ_TARGET_ALLOWLISTED_PREFIXES = [
     'afl-showmap',
     'afl-tmin',
     'honggfuzz',
-    'llvm-symbolizer',
-    'jazzer_driver',
     'jazzer_agent_deploy.jar',
+    'jazzer_driver',
+    'jazzer_driver_with_sanitizer',
+    'llvm-symbolizer',
 ]
 
 # Time for unpacking a build beyond which an error should be logged.
@@ -512,7 +515,7 @@ class Build(BaseBuild):
       # save us anything in this case and can be really expensive for large
       # builds (such as Chrome OS). Defer setting it until after the build has
       # been unpacked.
-      _set_random_fuzz_target_for_fuzzing_if_needed(
+      self._pick_fuzz_target(
           self._get_fuzz_targets_from_archive(build_local_archive),
           target_weights)
 
@@ -545,7 +548,7 @@ class Build(BaseBuild):
       # Set a random fuzz target now that the build has been unpacked, if we
       # didn't set one earlier. For an auxiliary build, fuzz target is already
       # specified during main build unpacking.
-      _set_random_fuzz_target_for_fuzzing_if_needed(
+      self._pick_fuzz_target(
           self._get_fuzz_targets_from_dir(build_dir), target_weights)
 
     # If this is partial build due to selected build files, then mark it as such
@@ -583,6 +586,11 @@ class Build(BaseBuild):
     for path in fuzzer_utils.get_fuzz_targets(build_dir):
       yield os.path.splitext(os.path.basename(path))[0]
 
+  def _pick_fuzz_target(self, fuzz_targets, target_weights):
+    """Selects a fuzz target for fuzzing."""
+    return _set_random_fuzz_target_for_fuzzing_if_needed(
+        fuzz_targets, target_weights)
+
   def setup(self):
     """Set up the build on disk, and set all the necessary environment
     variables. Should return whether or not build setup succeeded."""
@@ -597,12 +605,11 @@ class Build(BaseBuild):
     """Check if build already exists."""
     revision_file = os.path.join(self.build_dir, REVISION_FILE_NAME)
     if os.path.exists(revision_file):
-      file_handle = open(revision_file, 'r')
-      try:
-        current_revision = int(file_handle.read())
-      except ValueError:
-        current_revision = -1
-      file_handle.close()
+      with open(revision_file, 'r') as file_handle:
+        try:
+          current_revision = int(file_handle.read())
+        except ValueError:
+          current_revision = -1
 
       # We have the revision required locally, no more work to do, other than
       # setting application path environment variables.
@@ -717,7 +724,7 @@ class RegularBuild(Build):
 
       logs.log('Retrieved build r%d.' % self.revision)
     else:
-      _set_random_fuzz_target_for_fuzzing_if_needed(
+      self._pick_fuzz_target(
           self._get_fuzz_targets_from_dir(self.build_dir), self.target_weights)
 
       # We have the revision required locally, no more work to do, other than
@@ -740,8 +747,19 @@ class FuchsiaBuild(RegularBuild):
   FUCHSIA_BUILD_REL_PATH = os.path.join('build', 'out', 'default')
   FUCHSIA_DIR_REL_PATH = 'build'
 
+  def _pick_fuzz_target(self, fuzz_targets, target_weights):
+    """No-op, since Fuchsia builds pick targets later than other build types
+    and we aren't ready at the point that this is called by the superclass's
+    setup()."""
+
   def _get_fuzz_targets_from_dir(self, build_dir):
-    """Overridden to get targets list from fuchsia."""
+    """Returns a list of fuzz targets in a legacy Fuchsia build. For
+    undercoat-driven Fuchsia builds, a running instance is required to
+    enumerate targets so this is a no-op."""
+
+    if self.use_undercoat:
+      return []
+
     # Prevent App Engine import issues.
     from platforms.fuchsia.util.fuzzer import Fuzzer
     from platforms.fuchsia.util.host import Host
@@ -754,22 +772,14 @@ class FuchsiaBuild(RegularBuild):
             host.fuzzers, '', sanitizer, example_fuzzers=False)
     ]
 
-  def setup(self):
-    """Fuchsia build setup."""
+  def _setup_legacy_build(self):
+    """setup() for builds that don't use undercoat."""
     # Prevent App Engine import issues.
     from platforms import fuchsia
-    new_setup = not self.exists()
 
-    # Need to be set before fuchsia utils is called in setup().
-    environment.set_value(
-        'FUCHSIA_DIR', os.path.join(self.build_dir, self.FUCHSIA_DIR_REL_PATH))
-    environment.set_value('FUCHSIA_RESOURCES_DIR', self.build_dir)
-
-    assert environment.get_value('UNPACK_ALL_FUZZ_TARGETS_AND_FILES'), \
-        'Fuchsia does not support partial unpacks'
-    result = super().setup()
-    if not result:
-      return result
+    # Select a fuzzer, as we skipped doing so in the superclass's setup()
+    _set_random_fuzz_target_for_fuzzing_if_needed(
+        self._get_fuzz_targets_from_dir(self.build_dir), self.target_weights)
 
     # We set these values here, rather than in initial_qemu_setup, since
     # SYMBOLIZE_REL_PATH and LLVM_SYMBOLIZER_REL_PATH are properties of the
@@ -784,11 +794,147 @@ class FuchsiaBuild(RegularBuild):
 
     # Kill any stale processes that may be left over from previous build.
     fuchsia.device.stop_qemu()
-    if new_setup:
-      fuchsia.device.initial_qemu_setup()
+
+    fuchsia.device.initial_qemu_setup()
 
     fuchsia.device.start_qemu()
-    return result
+
+  def _setup_undercoat_build(self):
+    """setup() for builds that do use undercoat."""
+    # Prevent App Engine import issues.
+    from platforms import fuchsia
+
+    # Kill any stale undercoat instances (currently, this is in fact the only
+    # path through which instances are shut down)
+    fuchsia.undercoat.stop_all()
+
+    logs.log('Starting Fuchsia instance.')
+    handle = fuchsia.undercoat.start_instance()
+    environment.set_value('FUCHSIA_INSTANCE_HANDLE', handle)
+
+    # Select a fuzzer, now that a list is available
+    fuzz_targets = fuchsia.undercoat.list_fuzzers(handle)
+    _set_random_fuzz_target_for_fuzzing_if_needed(fuzz_targets,
+                                                  self.target_weights)
+
+  def setup(self):
+    """Fuchsia build setup."""
+    # Prevent App Engine import issues.
+    from platforms import fuchsia
+
+    # Decide per-build whether to use undercoat, based on rollout level
+    rollout_level = environment.get_value('FUCHSIA_UNDERCOAT_ROLLOUT_LEVEL', 0)
+    self.use_undercoat = random.random() < rollout_level
+
+    # Initially, only use undercoat for fuzz tasks
+    if environment.get_value('TASK_NAME') != 'fuzz':
+      self.use_undercoat = False
+
+    # Used by platforms.fuchsia.util
+    environment.set_value(
+        'FUCHSIA_DIR', os.path.join(self.build_dir, self.FUCHSIA_DIR_REL_PATH))
+
+    environment.set_value('FUCHSIA_RESOURCES_DIR', self.build_dir)
+
+    # Allow superclass's setup() to unpack the build
+    assert environment.get_value('UNPACK_ALL_FUZZ_TARGETS_AND_FILES'), \
+        'Fuchsia does not support partial unpacks'
+    result = super().setup()
+    if not result:
+      return result
+
+    # If selected, verify that undercoat is available in this build
+    if self.use_undercoat:
+      try:
+        fuchsia.undercoat.validate_api_version()
+      except (OSError, fuchsia.undercoat.UndercoatError) as e:
+        # Log an error and fall back to the legacy implementation
+        logs.log_warn('Undercoat selected but cannot be used: %s' % e)
+        self.use_undercoat = False
+
+    logs.log('Undercoat enabled: %s' % self.use_undercoat)
+    environment.set_value('FUCHSIA_USE_UNDERCOAT', self.use_undercoat)
+
+    # Finally, delegate to appropriate setup method
+    if self.use_undercoat:
+      self._setup_undercoat_build()
+    else:
+      self._setup_legacy_build()
+
+    return True
+
+
+class CuttlefishKernelBuild(RegularBuild):
+  """Represents a Android Cuttlefish kernel build."""
+
+  _IMAGE_FILES = ('bzImage', 'initramfs.img')
+
+  def setup(self):
+    """Android kernel build setup."""
+    from platforms.android import adb
+
+    result = super().setup()
+    if not result:
+      return result
+
+    # Download syzkaller binary folder.
+    if not environment.get_value('SYZKALLER_BUCKET_PATH'):
+      logs.log_error('SYZKALLER_BUCKET_PATH is not set for syzkaller.')
+      return False
+    archive_src_path = environment.get_value('SYZKALLER_BUCKET_PATH')
+    archive_dst_path = os.path.join(self.build_dir, 'syzkaller.zip')
+    storage.copy_file_from(archive_src_path, archive_dst_path)
+
+    # Extract syzkaller binary.
+    syzkaller_path = os.path.join(self.build_dir, 'syzkaller')
+    shell.remove_directory(syzkaller_path)
+    archive.unpack(archive_dst_path, syzkaller_path)
+    shell.remove_file(archive_dst_path)
+
+    environment.set_value('VMLINUX_PATH', self.build_dir)
+
+    cvd_dir = environment.get_value('CVD_DIR')
+    adb.stop_cuttlefish_device()
+
+    for image_filename in self._IMAGE_FILES:
+      # Copy new kernel image to Cuttlefish.
+      image_src = os.path.join(self.build_dir, image_filename)
+      image_dest = os.path.join(cvd_dir, image_filename)
+      adb.copy_to_cuttlefish(image_src, image_dest)
+
+    adb.start_cuttlefish_device(use_kernel=True)
+    adb.connect_to_cuttlefish_device()
+
+    return True
+
+
+class AndroidEmulatorBuild(RegularBuild):
+  """Represents an Android Emulator build."""
+
+  def setup(self):
+    """Android Emulator build setup."""
+    self._pre_setup()
+
+    # Download emulator image.
+    if not environment.get_value('ANDROID_EMULATOR_BUCKET_PATH'):
+      logs.log_error('ANDROID_EMULATOR_BUCKET_PATH is not set.')
+      return False
+    archive_src_path = environment.get_value('ANDROID_EMULATOR_BUCKET_PATH')
+    archive_dst_path = os.path.join(self.base_build_dir, 'emulator_bundle.zip')
+    storage.copy_file_from(archive_src_path, archive_dst_path)
+
+    # Extract emulator image.
+    self.emulator_path = os.path.join(self.base_build_dir, 'emulator')
+    shell.remove_directory(self.emulator_path)
+    archive.unpack(archive_dst_path, self.emulator_path)
+    shell.remove_file(archive_dst_path)
+
+    # Stop any stale emulator instances.
+    stop_script_path = os.path.join(self.emulator_path, 'stop')
+    stop_proc = new_process.ProcessRunner(stop_script_path)
+    stop_proc.run_and_wait()
+
+    return super().setup()
 
 
 class SymbolizedBuild(Build):
@@ -947,7 +1093,7 @@ class CustomBuild(Build):
       # Remove the archive.
       shell.remove_file(build_local_archive)
 
-    _set_random_fuzz_target_for_fuzzing_if_needed(
+    self._pick_fuzz_target(
         self._get_fuzz_targets_from_dir(self.build_dir), self.target_weights)
     return True
 
@@ -972,7 +1118,7 @@ class CustomBuild(Build):
     else:
       logs.log('Build already exists.')
 
-      _set_random_fuzz_target_for_fuzzing_if_needed(
+      self._pick_fuzz_target(
           self._get_fuzz_targets_from_dir(self.build_dir), self.target_weights)
 
     self._setup_application_path(build_update=build_update)
@@ -1252,6 +1398,11 @@ def setup_regular_build(revision,
     build_class = build_setup_host.RemoteRegularBuild
   elif environment.platform() == 'FUCHSIA':
     build_class = FuchsiaBuild
+  elif environment.is_android_emulator():
+    build_class = AndroidEmulatorBuild
+  elif (environment.is_android_cuttlefish() and
+        environment.is_kernel_fuzzer_job()):
+    build_class = CuttlefishKernelBuild
 
   build = build_class(
       base_build_dir,
@@ -1342,7 +1493,13 @@ def setup_custom_binary(target_weights=None):
 def setup_production_build(build_type):
   """Sets up build with a particular revision."""
   # Bail out if there are not stable and beta build urls.
-  if build_type == 'stable':
+  if build_type == 'extended_stable':
+    build_bucket_path = environment.get_value(
+        'EXTENDED_STABLE_BUILD_BUCKET_PATH')
+    # TODO(yuanjunh): remove it after ES exists.
+    if not build_bucket_path:
+      return None
+  elif build_type == 'stable':
     build_bucket_path = environment.get_value('STABLE_BUILD_BUCKET_PATH')
   elif build_type == 'beta':
     build_bucket_path = environment.get_value('BETA_BUILD_BUCKET_PATH')
@@ -1432,6 +1589,7 @@ def is_custom_binary():
 
 def has_production_builds():
   """Return a bool on if job type has build urls for stable and beta builds."""
+  # TODO(yuanjunh): change it if after ES exists.
   return (environment.get_value('STABLE_BUILD_BUCKET_PATH') and
           environment.get_value('BETA_BUILD_BUCKET_PATH'))
 

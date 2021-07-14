@@ -533,6 +533,21 @@ class StackAnalyzerTestcase(unittest.TestCase):
                                   expected_state, expected_stacktrace,
                                   expected_security_flag)
 
+  def test_java_manual_security_exception(self):
+    """Tests for Java exceptions manually marked as security issues."""
+    data = self._read_test_data('java_severity_medium_exception.txt')
+    expected_type = 'Uncaught exception'
+    expected_address = ''
+    expected_state = ('com.example.JsonSanitizerFuzzer.fuzzerTestOneInput\n'
+                      'com.google.gson.Gson.fromJson\n'
+                      'com.google.gson.Gson.fromJson\n')
+
+    expected_stacktrace = data
+    expected_security_flag = True
+    self._validate_get_crash_data(data, expected_type, expected_address,
+                                  expected_state, expected_stacktrace,
+                                  expected_security_flag)
+
   def test_java_fatal_exception(self):
     """Test for the java fatal exception format."""
     data = self._read_test_data('java_fatal_exception.txt')
@@ -805,6 +820,41 @@ class StackAnalyzerTestcase(unittest.TestCase):
                                   expected_state, expected_stacktrace,
                                   expected_security_flag)
 
+  def test_v8_check_trap(self):
+    """Test v8 CHECK failures that trigger SIGTRAP."""
+    data = self._read_test_data('v8_check_trap.txt')
+    expected_type = 'CHECK failure'
+    expected_address = ''
+    expected_state = (
+        'interpreter_result.result() == result_compiled in foo.cc\n'
+        'v8::internal::wasm::fuzzer::InterpretAndExecuteModule\n'
+        'v8::internal::wasm::fuzzer::WasmExecutionFuzzer::FuzzWasmModule\n')
+
+    expected_stacktrace = data
+    expected_security_flag = False
+
+    self._validate_get_crash_data(data, expected_type, expected_address,
+                                  expected_state, expected_stacktrace,
+                                  expected_security_flag)
+
+  def test_v8_check_no_sourcefile(self):
+    """Test v8 CHECK failures without source file information (e.g. from
+    official builds)."""
+    data = self._read_test_data('v8_check_no_sourcefile.txt')
+    expected_type = 'CHECK failure'
+    expected_address = ''
+    expected_state = (
+        'interpreter_result.result() == result_compiled\n'
+        'v8::internal::wasm::fuzzer::InterpretAndExecuteModule\n'
+        'v8::internal::wasm::fuzzer::WasmExecutionFuzzer::FuzzWasmModule\n')
+
+    expected_stacktrace = data
+    expected_security_flag = False
+
+    self._validate_get_crash_data(data, expected_type, expected_address,
+                                  expected_state, expected_stacktrace,
+                                  expected_security_flag)
+
   def test_v8_dcheck(self):
     """Test the v8 DCHECK failure."""
     data = self._read_test_data('v8_dcheck_symbolized.txt')
@@ -827,7 +877,7 @@ class StackAnalyzerTestcase(unittest.TestCase):
     data = self._read_test_data('v8_fatal_error_no_check.txt')
     expected_type = 'Fatal error'
     expected_address = ''
-    expected_state = 'v8::HandleScope::CreateHandle\n'
+    expected_state = 'Cannot create a handle without a HandleScope\n'
     expected_stacktrace = data
     expected_security_flag = False
 
@@ -881,8 +931,21 @@ class StackAnalyzerTestcase(unittest.TestCase):
                                   expected_security_flag)
 
   def test_v8_oom(self):
-    """Test a v8 out of memory condition."""
+    """Test a v8 JavaScript out of memory condition."""
     data = self._read_test_data('v8_oom.txt')
+    expected_type = ''
+    expected_address = ''
+    expected_state = ''
+    expected_stacktrace = ''
+    expected_security_flag = False
+
+    self._validate_get_crash_data(data, expected_type, expected_address,
+                                  expected_state, expected_stacktrace,
+                                  expected_security_flag)
+
+  def test_v8_process_oom(self):
+    """Test a v8 process out of memory condition."""
+    data = self._read_test_data('v8_process_oom.txt')
     expected_type = ''
     expected_address = ''
     expected_state = ''
@@ -936,7 +999,7 @@ class StackAnalyzerTestcase(unittest.TestCase):
   def test_v8_unknown_fatal_error(self):
     """Test a generic fatal error."""
     data = self._read_test_data('v8_unknown_fatal_error.txt')
-    expected_type = 'CHECK failure'
+    expected_type = 'Fatal error'
     expected_address = ''
     expected_state = ('something that isn\'t supported yet in '
                       'simulator-arm.cc\n')
@@ -1573,9 +1636,7 @@ class StackAnalyzerTestcase(unittest.TestCase):
     data = self._read_test_data('sanitizer_signal_abrt.txt')
     expected_type = 'Abrt'
     expected_address = ''
-    expected_state = ('/lib/x86_64-linux-gnu/libc-2.15.so\n'
-                      '/lib/x86_64-linux-gnu/libc-2.15.so\n'
-                      '/tmp/coredump\n')
+    expected_state = ('/tmp/coredump\n/tmp/coredump\n')
     expected_stacktrace = data
     expected_security_flag = False
 
@@ -2965,6 +3026,23 @@ class StackAnalyzerTestcase(unittest.TestCase):
                                   expected_state, expected_stacktrace,
                                   expected_security_flag)
 
+  def test_rust_ignores(self):
+    """Test that uninteresting frames are ignored for Rust."""
+    environment.set_value('ASSERTS_HAVE_SECURITY_IMPLICATION', False)
+
+    data = self._read_test_data('rust_ignores.txt')
+    expected_type = 'ASSERT'
+    expected_address = ''
+    expected_state = (
+        'called `Result::unwrap()` on an `Err` value: failed directive on '
+        'wasmtime/crates\n'
+        'wasmtime_fuzzing::oracles::spectest::ha380505b8ea313d4\n')
+    expected_stacktrace = data
+    expected_security_flag = False
+    self._validate_get_crash_data(data, expected_type, expected_address,
+                                  expected_state, expected_stacktrace,
+                                  expected_security_flag)
+
   def test_linux_kernel_library_libfuzzer(self):
     """Test Linux Kernel Library fuzzed with libfuzzer."""
     data = self._read_test_data('lkl_libfuzzer.txt')
@@ -3000,6 +3078,22 @@ class StackAnalyzerTestcase(unittest.TestCase):
                       'really_probe\n'
                       '__device_attach_driver\n')
     expected_address = '0x7f58af2ac9ec'
+    expected_stacktrace = data
+    expected_security_flag = True
+    self._validate_get_crash_data(data, expected_type, expected_address,
+                                  expected_state, expected_stacktrace,
+                                  expected_security_flag)
+
+  def test_swift(self):
+    """Test swift stacktrace."""
+    data = self._read_test_data('swift_invalid_free.txt')
+    expected_type = 'Invalid-free'
+    expected_state = ('SwiftProtobuf.BinaryDecoder.\n'
+                      'SwiftProtobuf.BinaryDecoder.decodeSingularGroupField'
+                      '<A where A: SwiftProtobuf.Me\n'
+                      'protocol witness for SwiftProtobuf.Decoder.'
+                      'decodeSingularGroupField<A where A1: \n')
+    expected_address = '0x555f65177ff0'
     expected_stacktrace = data
     expected_security_flag = True
     self._validate_get_crash_data(data, expected_type, expected_address,

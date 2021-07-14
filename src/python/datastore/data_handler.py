@@ -580,9 +580,8 @@ def get_stacktrace(testcase, stack_attribute='crash_stacktrace'):
   blobs.read_blob_to_disk(key, tmp_stacktrace_file)
 
   try:
-    handle = open(tmp_stacktrace_file)
-    result = handle.read()
-    handle.close()
+    with open(tmp_stacktrace_file) as handle:
+      result = handle.read()
   except:
     logs.log_error(
         'Unable to read stacktrace for testcase %d.' % testcase.key.id())
@@ -1098,19 +1097,17 @@ def bot_run_timed_out():
   if not run_timeout:
     return False
 
-  # Check that we have a valid start time from our heartbeat.
-  bot_name = environment.get_value('BOT_NAME')
-  heartbeat = data_types.Heartbeat.query(
-      data_types.Heartbeat.bot_name == bot_name).get()
-  if not heartbeat or not heartbeat.last_beat_time:
+  start_time = environment.get_value('START_TIME')
+  if not start_time:
     return False
+
+  start_time = datetime.datetime.utcfromtimestamp(start_time)
 
   # Actual run timeout takes off the duration for one task.
   average_task_duration = environment.get_value('AVERAGE_TASK_DURATION', 0)
   actual_run_timeout = run_timeout - average_task_duration
 
-  return dates.time_has_expired(
-      heartbeat.last_beat_time, seconds=actual_run_timeout)
+  return dates.time_has_expired(start_time, seconds=actual_run_timeout)
 
 
 # ------------------------------------------------------------------------------
@@ -1272,6 +1269,10 @@ def create_user_uploaded_testcase(key,
         utils.current_date_time(), uploader_email)
     # External jobs never get minimized.
     testcase.minimized_keys = 'NA'
+
+    # analyze_task sets this for non-external reproductions.
+    testcase.platform = job.platform.lower()
+    testcase.platform_id = testcase.platform
   else:
     testcase.crash_type = ''
     testcase.crash_state = 'Pending'
@@ -1295,8 +1296,6 @@ def create_user_uploaded_testcase(key,
   testcase.http_flag = bool(http_flag)
   testcase.archive_state = archive_state
   testcase.project_name = get_project_name(job.name)
-  testcase.platform = job.platform.lower()
-  testcase.platform_id = testcase.platform
 
   if archive_state or bundled:
     testcase.absolute_path = file_path_input
@@ -1348,6 +1347,7 @@ def create_user_uploaded_testcase(key,
   metadata.timestamp = testcase.timestamp
   metadata.bug_summary_update_flag = bug_summary_update_flag
   metadata.quiet_flag = quiet_flag
+  metadata.bug_information = testcase.bug_information
 
   if crash_data:
     if crash_analyzer.ignore_stacktrace(testcase.crash_stacktrace):

@@ -91,8 +91,9 @@ CHROME_MAC_STACK_FRAME_REGEX = re.compile(
     r'(\d+)')  # off[dec] (7)
 MSAN_TSAN_REGEX = re.compile(
     r'.*(ThreadSanitizer|MemorySanitizer):\s+(?!ABRT)(?!ILL)([^(:]+)')
+FATAL_ERROR_GENERIC_FAILURE = re.compile(r'#\s+()(.*)')
 FATAL_ERROR_CHECK_FAILURE = re.compile(
-    r'#\s+(Check failed: |RepresentationChangerError: node #\d+:)?(.*)')
+    r'#\s+(Check failed: |RepresentationChangerError: node #\d+:)(.*)')
 FATAL_ERROR_DCHECK_FAILURE = re.compile(r'#\s+(Debug check failed: )(.*)')
 FATAL_ERROR_REGEX = re.compile(r'#\s*Fatal error in (.*)')
 FATAL_ERROR_LINE_REGEX = re.compile(r'#\s*Fatal error in (.*), line [0-9]+')
@@ -105,7 +106,7 @@ GOOGLE_LOG_FATAL_REGEX = re.compile(GOOGLE_LOG_FATAL_PREFIX + r'\s*(.*)')
 HWASAN_ALLOCATION_TAIL_OVERWRITTEN_ADDRESS_REGEX = re.compile(
     r'.*ERROR: HWAddressSanitizer: allocation-tail-overwritten; '
     r'heap object \[([xX0-9a-fA-F]+),.*of size')
-JAZZER_JAVA_EXCEPTION_REGEX = re.compile('== Java Exception: .*: .*')
+JAZZER_JAVA_EXCEPTION_REGEX = re.compile('== Java Exception: .*')
 JAVA_EXCEPTION_CRASH_STATE_REGEX = re.compile(r'\s*at (.*)\(.*\)')
 KASAN_ACCESS_TYPE_REGEX = re.compile(r'(Read|Write) of size ([0-9]+)')
 KASAN_ACCESS_TYPE_ADDRESS_REGEX = re.compile(
@@ -135,26 +136,28 @@ LSAN_DIRECT_LEAK_REGEX = re.compile(r'Direct leak of ')
 LSAN_INDIRECT_LEAK_REGEX = re.compile(r'Indirect leak of ')
 MAC_GDB_CRASH_ADDRESS_REGEX = re.compile(
     r'Reason:.*at address[^0-9]*([0-9a-zA-Z]+)')
-OUT_OF_MEMORY_REGEX = re.compile(
-    r'.*('
-    r'# Allocation failed.*out of memory|'
-    r'::OnNoMemory|'
-    r'ERROR.*Sanitizer failed to allocate|'
-    r'FatalProcessOutOfMemory|'
-    r'FX_OutOfMemoryTerminate|'
-    r'Out of memory\. Dying.|'
-    r'Out of memory\. size=|'
-    r'Sanitizer: allocation-size-too-big|'
-    r'Sanitizer: calloc-overflow|'
-    r'Sanitizer: calloc parameters overflow|'
-    r'Sanitizer: requested allocation size.*exceeds maximum supported size|'
-    r'TerminateBecauseOutOfMemory|'
-    r'allocator is out of memory trying to allocate|'
-    r'blinkGCOutOfMemory|'
-    r'couldnt allocate.*Out of memory|'
-    r'libFuzzer: out-of-memory \(|'
-    r'rss limit exhausted|'
-    r'in rust_oom).*')
+OUT_OF_MEMORY_REGEX = re.compile(r'.*(?:%s).*' % '|'.join([
+    r'# Allocation failed.*out of memory',
+    r'::OnNoMemory',
+    r'ERROR.*Sanitizer failed to allocate',
+    r'FatalProcessOutOfMemory',  # V8
+    r'Fatal (?:process|JavaScript) out of memory:',  # V8
+    r'Fatal JavaScript invalid size error',  # V8
+    r'FX_OutOfMemoryTerminate',
+    r'Out of memory\. Dying.',
+    r'Out of memory\. size=',
+    r'Sanitizer: allocation-size-too-big',
+    r'Sanitizer: calloc-overflow',
+    r'Sanitizer: calloc parameters overflow',
+    r'Sanitizer: requested allocation size.*exceeds maximum supported size',
+    r'TerminateBecauseOutOfMemory',
+    r'allocator is out of memory trying to allocate',
+    r'blinkGCOutOfMemory',
+    r'couldnt allocate.*Out of memory',
+    r'libFuzzer: out-of-memory \(',
+    r'rss limit exhausted',
+    r'in rust_oom'
+]))
 RUNTIME_ERROR_REGEX = re.compile(r'#\s*Runtime error in (.*)')
 RUNTIME_ERROR_LINE_REGEX = re.compile(r'#\s*Runtime error in (.*), line [0-9]+')
 RUST_ASSERT_REGEX = re.compile(r'thread\s.*\spanicked at \'([^\']*)',
@@ -168,6 +171,7 @@ SAN_CRASH_TYPE_ADDRESS_REGEX = re.compile(
 SAN_DEADLYSIGNAL_REGEX = re.compile(r'.*:DEADLYSIGNAL')
 SAN_FPE_REGEX = re.compile(r'.*[a-zA-Z]+Sanitizer: FPE ')
 SAN_ILL_REGEX = re.compile(r'.*[a-zA-Z]+Sanitizer: ILL ')
+SAN_TRAP_REGEX = re.compile(r'.*[a-zA-Z]+Sanitizer: TRAP ')
 SAN_SEGV_CRASH_TYPE_REGEX = re.compile(
     r'.*The signal is caused by a ([A-Z]+) memory access.')
 # FIXME: Replace when better ways to check signal crashes are available.
@@ -334,6 +338,8 @@ STACK_FRAME_IGNORE_REGEXES = [
     r'^pthread_kill$',
     r'^raise$',
     r'^tgkill$',
+    r'^__chk_fail$',
+    r'^__fortify_fail$',
 
     # Function names (startswith).
     r'^(|__)aeabi_',
@@ -433,6 +439,7 @@ STACK_FRAME_IGNORE_REGEXES = [
     r'^print_trailer',
     r'^realloc',
     r'^rust_begin_unwind',
+    r'^rust_fuzzer_test_input',
     r'^rust_oom',
     r'^scanf',
     r'^show_stack',
@@ -484,6 +491,7 @@ STACK_FRAME_IGNORE_REGEXES = [
 
     # File paths.
     r'.* base/callback',
+    r'.* /rust(|c)/',
     r'.*/AOSP\-toolchain/',
     r'.*/bindings/ToV8\.h',
     r'.*/crosstool/',
@@ -525,6 +533,9 @@ STACK_FRAME_IGNORE_REGEXES = [
     # Android kernel stack frame ignores.
     r'^print_address_description',
     r'^_etext',
+
+    # Swift specific.
+    r'^_swift_stdlib_'
 ]
 
 STACK_FRAME_IGNORE_REGEXES_IF_SYMBOLIZED = [
@@ -532,6 +543,7 @@ STACK_FRAME_IGNORE_REGEXES_IF_SYMBOLIZED = [
     r'.*libc\+\+\.so',
     r'.*libc\+\+_shared\.so',
     r'.*libstdc\+\+\.so',
+    r'.*libc-.*\.so',
 ]
 
 IGNORE_CRASH_TYPES_FOR_ABRT_BREAKPOINT_AND_ILLS = [
